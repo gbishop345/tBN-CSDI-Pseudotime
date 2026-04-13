@@ -45,6 +45,5 @@ Thumbs.db
 blue_noise/*.npz
 # blue_noise/*.pt
 
-# mESC dataset caches (next to ExpressionData.csv)
-data/mESC/*.pk
-data/mESC/ExpressionData.csv
+# Datasets (expression CSVs, reordered outputs, *.pk caches next to CSVs)
+data/

@@ -8,6 +8,7 @@ Build reordered CSVs:
 
 Same sweep as exe_rna_reorder.py; uses `dataset_rna` tensors via `dataset_mesc_reorder.get_dataloader`.
 Default config `base_mesc.yaml` (same blue-noise defaults as RNA; run `gen_bn.py --dataset mesc` first).
+Training uses the top ``MAX_GENES`` (100) columns by variance so the noise tile matches that Cholesky.
 """
 import argparse
 import os

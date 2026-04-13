@@ -60,7 +60,35 @@ def random_missing_and_per_gene_normalize(
     )
 
 
-def parse_rna_data(df, missing_ratio=0.1):
+def _top_gene_columns_by_variance(df, gene_cols, k: int, zero_as_missing: bool) -> list:
+    """
+    Top ``k`` gene column names by descending sample variance over all rows (stable tie-break).
+    Observed: finite values; if ``zero_as_missing``, treat 0 as missing (mESC-style).
+    """
+    if k >= len(gene_cols):
+        return list(gene_cols)
+    variances = np.empty(len(gene_cols), dtype=np.float64)
+    for j, col in enumerate(gene_cols):
+        v = df[col].to_numpy(dtype=np.float64, copy=False)
+        if zero_as_missing:
+            obs = np.isfinite(v) & (v != 0.0)
+        else:
+            obs = np.isfinite(v) & ~np.isnan(v)
+        x = v[obs]
+        if x.size < 2:
+            variances[j] = -np.inf
+        else:
+            variances[j] = np.var(x, ddof=1)
+    order = np.argsort(-variances, kind="stable")
+    return [gene_cols[i] for i in order[:k]]
+
+
+def parse_rna_data(
+    df,
+    missing_ratio=0.1,
+    max_genes=None,
+    zero_as_missing=False,
+):
     """
     Creates:
       observed_values: (Cells, Time, Genes)
@@ -69,9 +97,14 @@ def parse_rna_data(df, missing_ratio=0.1):
     Normalizes 'observed_values' so that only observed points are scaled, others remain 0.
     Supports unequal cells per timepoint: pads shorter timepoints with zeros (mask=0).
     Timepoint count and gene count come only from the dataframe (no fixed T or G).
+
+    If ``max_genes`` is set and smaller than the number of gene columns, keep the top genes
+    by variance (same idea as ``dataset_mesc``). Use ``zero_as_missing=True`` for mESC reordered CSVs.
     """
     timepoints = sorted(df["h"].unique())
     genes = get_gene_names(df)
+    if max_genes is not None and len(genes) > max_genes:
+        genes = _top_gene_columns_by_variance(df, genes, max_genes, zero_as_missing)
     counts = [df[df["h"] == h].shape[0] for h in timepoints]
     num_cells = max(counts)
 
@@ -91,20 +124,39 @@ def parse_rna_data(df, missing_ratio=0.1):
     return ov, om, gt, timepoints
 
 class RNA_Dataset(Dataset):
-    def __init__(self, eval_length=None, use_index_list=None, missing_ratio=0.1, seed=0, file_path=None):
+    def __init__(
+        self,
+        eval_length=None,
+        use_index_list=None,
+        missing_ratio=0.1,
+        seed=0,
+        file_path=None,
+        max_genes=None,
+        zero_as_missing=False,
+    ):
         np.random.seed(seed)
         self.eval_length = eval_length
         self._file_path = file_path if file_path is not None else get_rna_file()
         # Cache keyed by path so reordered vs original don't clash
         base = self._file_path.replace(".csv", "")
-        cache_path = f"{base}_missing{missing_ratio}_seed{seed}.pk"
+        if max_genes is not None:
+            cache_path = (
+                f"{base}_gvar{max_genes}_zm{int(zero_as_missing)}_missing{missing_ratio}_seed{seed}.pk"
+            )
+        else:
+            cache_path = f"{base}_missing{missing_ratio}_seed{seed}.pk"
 
         if not os.path.isfile(cache_path):
             df = pd.read_csv(self._file_path)
             (self.observed_values,
              self.observed_masks,
              self.gt_masks,
-             self.timepoints) = parse_rna_data(df, missing_ratio)
+             self.timepoints) = parse_rna_data(
+                df,
+                missing_ratio,
+                max_genes=max_genes,
+                zero_as_missing=zero_as_missing,
+            )
             with open(cache_path, "wb") as f:
                 pickle.dump(
                     [self.observed_values, self.observed_masks, self.gt_masks, self.timepoints],
@@ -138,9 +190,22 @@ class RNA_Dataset(Dataset):
     def __len__(self):
         return len(self.use_index_list)
 
-def get_dataloader(seed=1, batch_size=16, missing_ratio=0.1, file_path=None):
+def get_dataloader(
+    seed=1,
+    batch_size=16,
+    missing_ratio=0.1,
+    file_path=None,
+    max_genes=None,
+    zero_as_missing=False,
+):
     np.random.seed(seed)  # Ensure reproducibility
-    full_dataset = RNA_Dataset(missing_ratio=missing_ratio, seed=seed, file_path=file_path)
+    full_dataset = RNA_Dataset(
+        missing_ratio=missing_ratio,
+        seed=seed,
+        file_path=file_path,
+        max_genes=max_genes,
+        zero_as_missing=zero_as_missing,
+    )
     num_cells = full_dataset.num_cells
 
     # Shuffle the indices randomly
@@ -156,12 +221,30 @@ def get_dataloader(seed=1, batch_size=16, missing_ratio=0.1, file_path=None):
     test_indices  = all_indices[num_train + num_valid:]
 
     # Create datasets using the shuffled indices
-    train_dataset = RNA_Dataset(use_index_list=train_indices,
-                                missing_ratio=missing_ratio, seed=seed, file_path=file_path)
-    valid_dataset = RNA_Dataset(use_index_list=valid_indices,
-                                missing_ratio=missing_ratio, seed=seed, file_path=file_path)
-    test_dataset  = RNA_Dataset(use_index_list=test_indices,
-                                missing_ratio=missing_ratio, seed=seed, file_path=file_path)
+    train_dataset = RNA_Dataset(
+        use_index_list=train_indices,
+        missing_ratio=missing_ratio,
+        seed=seed,
+        file_path=file_path,
+        max_genes=max_genes,
+        zero_as_missing=zero_as_missing,
+    )
+    valid_dataset = RNA_Dataset(
+        use_index_list=valid_indices,
+        missing_ratio=missing_ratio,
+        seed=seed,
+        file_path=file_path,
+        max_genes=max_genes,
+        zero_as_missing=zero_as_missing,
+    )
+    test_dataset = RNA_Dataset(
+        use_index_list=test_indices,
+        missing_ratio=missing_ratio,
+        seed=seed,
+        file_path=file_path,
+        max_genes=max_genes,
+        zero_as_missing=zero_as_missing,
+    )
 
     # Create DataLoaders
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)  # Enable shuffle for training
