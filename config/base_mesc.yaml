@@ -1,0 +1,38 @@
+
+# Same as base.yaml but mESC: T from data; G = MAX_GENES (100) = top variance among observed entries (0 = missing in CSV).
+# Run ``python gen_bn.py --dataset mesc`` so ``cov_save_path`` matches tile size; use CLI ``--white-noise`` for vanilla CSDI.
+
+#type: args
+
+train:
+  epochs: 200
+  batch_size: 16
+  lr: 1.0e-3
+  itr_per_epoch: 1.0e+8
+
+
+diffusion:
+  layers: 4
+  channels: 64
+  nheads: 8
+  diffusion_embedding_dim: 128
+  beta_start: 0.0001
+  beta_end: 0.5
+  num_steps: 50
+  schedule: "quad"
+  is_linear: False
+
+model:
+  is_unconditional: 0
+  timeemb: 128
+  featureemb: 16
+  target_strategy: "random"
+  use_blue_noise: true
+  cov_save_path: blue_noise/blue_noise_chol_matrix_mesc.pt
+  noise_blend_schedule: "sigmoid"
+  noise_blend_reverse: false
+  noise_blend_step_t: null
+  noise_blend_w_start: 0.0
+  gamma_start: 0.0
+  gamma_end: 3.0
+  gamma_tau: 0.2

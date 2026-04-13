@@ -10,53 +10,45 @@ def get_rna_file():
 def get_gene_names(df):
     return [col for col in df.columns if col != "h"]
 
-def parse_rna_data(df, missing_ratio=0.1):
+
+def random_missing_and_per_gene_normalize(
+    observed_values: np.ndarray,
+    observed_masks: np.ndarray,
+    missing_ratio: float,
+) -> tuple:
     """
-    Creates:
-      observed_values: (Cells, Time, Genes)
-      observed_masks:  (Cells, Time, Genes)  # from CSV's non-NaNs
-      gt_masks:        (Cells, Time, Genes)  # a random subset of observed_masks
-    Normalizes 'observed_values' so that only observed points are scaled, others remain 0.
+    Build gt_masks (random subset of observed entries hidden for training) and z-score genes
+    using only positions where observed_masks is True. observed_masks returned unchanged.
+    Used by ``parse_rna_data`` and ``dataset_mesc.parse_mesc_data``.
     """
-    timepoints = sorted(df["h"].unique())
-    genes = get_gene_names(df)
-    num_cells = df[df["h"] == timepoints[0]].shape[0]
+    observed_values = np.asarray(observed_values, dtype=float)
+    observed_masks = np.asarray(observed_masks, dtype=bool)
 
-    # 1) Create shape (Cells, Time, Genes)
-    observed_values = np.zeros((num_cells, len(timepoints), len(genes)), dtype=float)
-    observed_masks  = np.zeros((num_cells, len(timepoints), len(genes)), dtype=bool)
-
-    for t_idx, h in enumerate(timepoints):
-        values_at_t = df[df["h"] == h][genes].values  # (num_cells, num_genes)
-        observed_values[:, t_idx, :] = np.nan_to_num(values_at_t)
-        observed_masks[:, t_idx, :]  = ~np.isnan(values_at_t)
-
-    # 2) random missing => create 'gt_masks'
-    observed_masks_flat = observed_masks.reshape(-1).copy()
-    obs_indices = np.where(observed_masks_flat)[0]
+    om_flat = observed_masks.reshape(-1).copy()
+    obs_indices = np.where(om_flat)[0]
     miss_count = int(len(obs_indices) * missing_ratio)
-    miss_indices = np.random.choice(obs_indices, miss_count, replace=False)
-    observed_masks_flat[miss_indices] = False
-    gt_masks = observed_masks_flat.reshape(observed_masks.shape)
+    if miss_count > 0 and len(obs_indices) > 0:
+        miss_indices = np.random.choice(obs_indices, miss_count, replace=False)
+        om_flat[miss_indices] = False
+    gt_masks = om_flat.reshape(observed_masks.shape)
 
-    # 3) flatten for normalization
-    Cells, Time, Genes = observed_values.shape
-    tmp_values = observed_values.reshape(-1, Genes)
-    tmp_masks  = observed_masks.reshape(-1, Genes).astype(bool)
-    mean = np.zeros(Genes, dtype=float)
-    std  = np.zeros(Genes, dtype=float)
+    cells, time, genes = observed_values.shape
+    tmp_values = observed_values.reshape(-1, genes)
+    tmp_masks = observed_masks.reshape(-1, genes).astype(bool)  # full observation mask for stats
+    mean = np.zeros(genes, dtype=float)
+    std = np.zeros(genes, dtype=float)
 
-    for g in range(Genes):
+    for g in range(genes):
         c_data = tmp_values[:, g][tmp_masks[:, g]]
         if len(c_data) > 1:
             mean[g] = c_data.mean()
-            std[g]  = c_data.std()
+            std[g] = c_data.std()
         else:
-            mean[g], std[g] = 0., 1.
+            mean[g], std[g] = 0.0, 1.0
         if std[g] < 1e-8:
             std[g] = 1e-8
 
-    for g in range(Genes):
+    for g in range(genes):
         tmp_values[:, g] = (tmp_values[:, g] - mean[g]) / std[g]
     tmp_values = tmp_values * tmp_masks
     observed_values = tmp_values.reshape(observed_values.shape)
@@ -65,17 +57,50 @@ def parse_rna_data(df, missing_ratio=0.1):
         observed_values.astype("float32"),
         observed_masks.astype("float32"),
         gt_masks.astype("float32"),
-        timepoints
     )
 
+
+def parse_rna_data(df, missing_ratio=0.1):
+    """
+    Creates:
+      observed_values: (Cells, Time, Genes)
+      observed_masks:  (Cells, Time, Genes)  # from CSV's non-NaNs
+      gt_masks:        (Cells, Time, Genes)  # a random subset of observed_masks
+    Normalizes 'observed_values' so that only observed points are scaled, others remain 0.
+    Supports unequal cells per timepoint: pads shorter timepoints with zeros (mask=0).
+    Timepoint count and gene count come only from the dataframe (no fixed T or G).
+    """
+    timepoints = sorted(df["h"].unique())
+    genes = get_gene_names(df)
+    counts = [df[df["h"] == h].shape[0] for h in timepoints]
+    num_cells = max(counts)
+
+    observed_values = np.zeros((num_cells, len(timepoints), len(genes)), dtype=float)
+    observed_masks = np.zeros((num_cells, len(timepoints), len(genes)), dtype=bool)
+
+    for t_idx, h in enumerate(timepoints):
+        block = df[df["h"] == h][genes].values  # (n_t, num_genes)
+        n_t = block.shape[0]
+        vals = np.nan_to_num(block)
+        observed_values[:n_t, t_idx, :] = vals
+        observed_masks[:n_t, t_idx, :] = ~np.isnan(block)
+
+    ov, om, gt = random_missing_and_per_gene_normalize(
+        observed_values, observed_masks, missing_ratio
+    )
+    return ov, om, gt, timepoints
+
 class RNA_Dataset(Dataset):
-    def __init__(self, eval_length=None, use_index_list=None, missing_ratio=0.1, seed=0):
+    def __init__(self, eval_length=None, use_index_list=None, missing_ratio=0.1, seed=0, file_path=None):
         np.random.seed(seed)
         self.eval_length = eval_length
-        cache_path = f"{get_rna_file().replace('.csv', '')}_missing{missing_ratio}_seed{seed}.pk"
+        self._file_path = file_path if file_path is not None else get_rna_file()
+        # Cache keyed by path so reordered vs original don't clash
+        base = self._file_path.replace(".csv", "")
+        cache_path = f"{base}_missing{missing_ratio}_seed{seed}.pk"
 
         if not os.path.isfile(cache_path):
-            df = pd.read_csv(get_rna_file())
+            df = pd.read_csv(self._file_path)
             (self.observed_values,
              self.observed_masks,
              self.gt_masks,
@@ -113,11 +138,11 @@ class RNA_Dataset(Dataset):
     def __len__(self):
         return len(self.use_index_list)
 
-def get_dataloader(seed=1, batch_size=16, missing_ratio=0.1):
+def get_dataloader(seed=1, batch_size=16, missing_ratio=0.1, file_path=None):
     np.random.seed(seed)  # Ensure reproducibility
-    full_dataset = RNA_Dataset(missing_ratio=missing_ratio, seed=seed)
+    full_dataset = RNA_Dataset(missing_ratio=missing_ratio, seed=seed, file_path=file_path)
     num_cells = full_dataset.num_cells
-    
+
     # Shuffle the indices randomly
     all_indices = np.arange(num_cells)
     np.random.shuffle(all_indices)
@@ -132,15 +157,18 @@ def get_dataloader(seed=1, batch_size=16, missing_ratio=0.1):
 
     # Create datasets using the shuffled indices
     train_dataset = RNA_Dataset(use_index_list=train_indices,
-                                missing_ratio=missing_ratio, seed=seed)
+                                missing_ratio=missing_ratio, seed=seed, file_path=file_path)
     valid_dataset = RNA_Dataset(use_index_list=valid_indices,
-                                missing_ratio=missing_ratio, seed=seed)
+                                missing_ratio=missing_ratio, seed=seed, file_path=file_path)
     test_dataset  = RNA_Dataset(use_index_list=test_indices,
-                                missing_ratio=missing_ratio, seed=seed)
+                                missing_ratio=missing_ratio, seed=seed, file_path=file_path)
 
     # Create DataLoaders
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)  # Enable shuffle for training
     valid_loader = DataLoader(valid_dataset, batch_size=batch_size, shuffle=False)
     test_loader  = DataLoader(test_dataset,  batch_size=batch_size, shuffle=False)
 
-    return train_loader, valid_loader, test_loader
+    # observed_values: (num_cells, timepoints, genes)
+    num_timepoints = full_dataset.observed_values.shape[1]
+    num_genes = full_dataset.observed_values.shape[2]
+    return train_loader, valid_loader, test_loader, num_genes, num_timepoints

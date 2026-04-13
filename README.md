@@ -1,110 +1,211 @@
 # tBN-CSDI
 
-This is a modified version of CSDI to add a blue noise schdule to the standard noise process. I added a lot of comments to help identify the new changes
+Conditional diffusion for spatiotemporal RNA-style data (genes × experimental time per cell). This repo extends the usual CSDI setup with **optional correlated “blue” noise** (Cholesky-colored Gaussian on a 2D gene×time tile), a **time-dependent blend** between white and blue noise, and **rectified noise** (Hungarian-based alignment). You can run **vanilla CSDI** (white noise only) with a single flag.
 
-The only file that was modified was main_model.py in the CSDI folder. 
+---
 
-Modifications:
-1. gen_bn.py is used to precompute blue noise for the main process to use. This is not fully refined as the paper does not explain exactly how they did this part.
-   
-2. The next modification is to use a rectified mapping for the noise. The original paper mentioned using a flow based matching however this lead to major overfitting so I went with a mapping based off hungarian assignment which performed much better
-
-3. The blending of Gaussian noise and blue noise is time dependent based on a gamma function which is added to calculate a blending factor based on the time step sampled.
-
-4. The foward and reverse process where modified to combine the Gaussian noise to the 2D blue noise based off of the gamma blending function. they were also modified to apply the rectified mapping to the blended noise. The rest of the foward and reverse process where left the same.
-
-5. there was no modification to any other parts of the model so the effects on the performance could be directly associated to the addition of the blue noise scheduler. 
-
-6. I also was playing around with using a precomputed Feature X Time covariance decay matrix to sample from instead of standard blue noise, This worked quite well and is in main_model_cov.py
-
-
-
-To Download the Physio Data:
-
-python download.py physio
-
-This will:
-- Download the dataset from PhysioNet
-- Extract it to `data/physio/set-a/`
-- Create the necessary directory structure
-
-### 2. Precompute Covariance Matrix
-
-The model uses a precomputed 64x64 covariance matrix for correlated noise generation. This will be automatically created on first run, but you can precompute it manually:
-
-```python
-import torch
-from main_model import CSDI_base
-
-# Create a dummy config for matrix computation
-config = {
-    "model": {
-        "rho_feat": 0.5,
-        "rho_time": 0.5,
-        "cov_save_path": "cov_matrix_tile.pt"
-    }
-}
-
-# This will create the covariance matrix file
-model = CSDI_base(target_dim=35, config=config, device='cpu')
-```
-
-Or Just:
-python gen_bn.py
-
-The covariance matrix will be saved as `cov_matrix_tile.pt` in the root directory.
-
-## Running Experiments
-
-### Training and Testing
-
-Train a new model and run imputation:
+## Setup
 
 ```bash
-python exe_physio.py --testmissingratio 0.1 --nsample 100
+cd /path/to/tBN-CSDI
+python -m venv .venv
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
 ```
 
-Parameters:
-- `--testmissingratio`: Missing data ratio (default: 0.1)
-- `--nsample`: Number of samples for evaluation (default: 100)
-- `--nfold`: Cross-validation fold (0-4, default: 0)
-- `--device`: Device to use (default: 'cuda:0')
-- `--seed`: Random seed (default: 1)
+Train and evaluate from the **repository root** so paths like `config/base.yaml` and `blue_noise/…` resolve correctly.
 
-### Using Pretrained Model
+---
 
-If you have a pretrained model, you can use it for testing:
+## Quick reference: what to run
+
+| Goal | Command |
+|------|---------|
+| Precompute blue-noise Cholesky (RNA layout) | `python gen_bn.py --dataset rna` |
+| Precompute blue-noise Cholesky (mESC layout) | `python gen_bn.py --dataset mesc` |
+| Train on standard RNA CSV | `python exe_rna.py` |
+| Train on mESC matrix | `python exe_mesc.py` |
+| Train on pseudotime-reordered RNA | Generate CSV with `reorder_rna.py`, then `python exe_rna_reorder.py` |
+| Train on pseudotime-reordered mESC | Generate CSV with `reorder_rna.py --dataset mesc`, then `python exe_mesc_reorder.py` |
+| **Vanilla CSDI** (no blue noise) | Add `--white-noise` to any `exe_*.py` (or set `use_blue_noise: false` in YAML) |
+
+---
+
+## Generating blue noise (`gen_bn.py`)
+
+Blue noise is defined on a **2D grid of size `(n_genes, n_timepoints)`**, matching the diffusion noise layout (`tile_k × tile_l`) for one training example. The script builds many binary masks (simulated annealing), estimates their covariance, projects to a positive semidefinite matrix, and saves a **Cholesky factor**.
+
+**Outputs** (created under `blue_noise/`):
+
+- `blue_noise_ref_masks_{rna|mesc}.npz` — large; listed in `.gitignore`
+- `blue_noise_chol_matrix_{rna|mesc}.pt` — used at train time
+
+**Commands:**
 
 ```bash
-python exe_physio.py --modelfolder pretrained --testmissingratio 0.1 --nsample 100
+python gen_bn.py --dataset rna
+python gen_bn.py --dataset rna --input data/rna/rna.csv          # match the CSV you train on
+python gen_bn.py --dataset mesc
+python gen_bn.py --dataset mesc --input data/mESC/ExpressionData.csv
 ```
 
-### Unconditional Generation
+**Defaults:**
 
-For unconditional generation (without conditioning on observed data):
+- **RNA:** dimensions inferred from `data/rna/rna_reordered_dpt.csv` (override with `--input` to match your training file exactly).
+- **mESC:** dimensions from `data/mESC/ExpressionData.csv` (same gene/time logic as `dataset_mesc.py`, including `MAX_GENES`).
+
+**Important:** `(n_genes, n_timepoints)` must match the dataloader used in training. Reordering **rows** in a CSV does **not** change gene count or distinct `h` values, so the Cholesky size is unchanged—but training on a **different** CSV (different columns or timepoints) requires regenerating `gen_bn` for that layout.
+
+**Config:** set `model.cov_save_path` in YAML, e.g.:
+
+- RNA: `blue_noise/blue_noise_chol_matrix_rna.pt` (`config/base.yaml`)
+- mESC: `blue_noise/blue_noise_chol_matrix_mesc.pt` (`config/base_mesc.yaml`)
+
+Wrapper: `./run_gen_bn.sh --dataset rna` (forwards args to `gen_bn.py`).
+
+---
+
+## Vanilla CSDI vs tBN-CSDI
+
+| Mode | How | Noise in forward process |
+|------|-----|---------------------------|
+| **Vanilla CSDI** | `--white-noise` on `exe_*.py`, or `use_blue_noise: false` in config | i.i.d. Gaussian only |
+| **tBN-CSDI** | `use_blue_noise: true` (default in `base.yaml` and `base_mesc.yaml`) and valid `cov_save_path` | Blend of Gaussian and Cholesky-correlated “blue” noise (see below) |
+
+If `use_blue_noise: true` but the Cholesky file is missing, training will raise a clear error—run `gen_bn.py` for the matching dataset (`--dataset rna` or `mesc`) or pass **`--white-noise`** for vanilla CSDI without a matrix.
+
+---
+
+## Noise blend schedule (tBN-CSDI only)
+
+When `use_blue_noise: true`, the per-step noise is:
+
+\[
+\epsilon = w(t)\,\epsilon_{\text{white}} + (1 - w(t))\,\epsilon_{\text{blue}}
+\]
+
+where \(w(t)\) is the **Gaussian weight** (higher \(w\) → more white noise). Schedule is controlled by `model.noise_blend_schedule` and related keys in `config/*.yaml`, or overridden from the CLI (see `rna_experiment_sweep.add_sweep_arguments`).
+
+### Schedules (`noise_blend_schedule`)
+
+| Value | Meaning |
+|-------|---------|
+| `sigmoid` | \(w(t) = \sigma(\gamma_{\text{start}} + (\gamma_{\text{end}}-\gamma_{\text{start}})(t/T)^{\tau})\) with `gamma_start`, `gamma_end`, `gamma_tau` |
+| `linear` | \(w\) increases linearly from `noise_blend_w_start` to 1 over diffusion indices |
+| `cumulative` | Same “shape” idea as the sigmoid schedule for the cumulative curve; per-step mixing uses the internal recurrence documented in `main_model.py` |
+| `step` | \(w = \text{noise\_blend\_w\_start}\) for \(t < \text{noise\_blend\_step\_t}\), else \(w = 1\) |
+
+**Sigmoid schedule:** the default `gamma_start: 0` is **not** “no Gaussian noise” at the first step. At \(t=0\), \(w(0)=\sigma(\gamma_{\text{start}})\), so **`gamma_start = 0` ⇒ \(w(0)=\sigma(0)=0.5\)** — equal mix of white and blue. To push the start toward mostly blue (small \(w\)), use a **negative** `gamma_start` (e.g. `--gamma-start -6` or `--nearly-all-blue-start`, giving \(\sigma(-6)\approx 0.0025\) white at \(t=0\)).
+
+CLI overrides:
 
 ```bash
-python exe_physio.py --unconditional --testmissingratio 0.1 --nsample 100
+--noise-blend-schedule sigmoid     # linear | cumulative | step
+--gamma-start -6                   # sigmoid: more blue at start (σ(-6)≈0.0025 white at t=0)
+--nearly-all-blue-start            # sets gamma_start = -6
+--blend-start 0.2                  # linear / step: initial Gaussian weight in [0,1]
+--noise-blend-step-t 25            # step: threshold index (see YAML default null → num_steps//2)
+--noise-blend-reverse              # use effective time (T-1)-t so the schedule runs backward along indices
 ```
 
-## Configuration
+YAML keys: `gamma_start`, `gamma_end`, `gamma_tau`, `noise_blend_w_start`, `noise_blend_step_t`, `noise_blend_reverse`, optional per-schedule `noise_blend_reverse_*` overrides (e.g. `noise_blend_reverse_sigmoid`; commented in `base.yaml`).
 
-The model configuration is defined in `config/base.yaml`. Key parameters include:
+---
 
-- **Diffusion**: Number of steps, beta schedule, network architecture
-- **Model**: Time/fature embedding dimensions, target strategy
-- **Noise**: Correlation parameters (rho_feat, rho_time), gamma schedule
+## Training entry points
 
-## Output
+All training scripts share the same sweep driver: **`rna_experiment_sweep.py`** (`add_sweep_arguments`, `run_sweep`). Typical pattern:
 
-Results will be saved in:
-- `save/physio_fold{N}_{timestamp}/` - Model checkpoints and results
-- `cov_matrix_tile.pt` - Precomputed covariance matrix
+- Multiple **missing ratios** (default `0.1 0.3 0.5 0.7 0.9`) × **`ntrials`** (default 5).
+- Each trial uses seed `base_seed + trial_index` for splits and dataset cache; the **same** train/valid/test cell split is used across missing ratios for a fair comparison.
 
-## Visualization
+### Scripts
 
-Use the provided Jupyter notebook to visualize results:
+| Script | Data | Default config |
+|--------|------|----------------|
+| `exe_rna.py` | `data/rna/rna.csv` | `config/base.yaml` |
+| `exe_rna_reorder.py` | Reordered RNA (see below) | `config/base.yaml` |
+| `exe_mesc.py` | `data/mESC/ExpressionData.csv` via `dataset_mesc` | `config/base_mesc.yaml` |
+| `exe_mesc_reorder.py` | Reordered mESC wide CSV | `config/base_mesc.yaml` |
+
+### Common CLI arguments
+
+```
+--config base.yaml              # or base_mesc.yaml; path under config/
+--device cuda:0
+--seed 1
+--missingratios 0.1 0.5 0.9
+--testmissingratio 0.5          # single ratio only
+--ntrials 5
+--nsample 100                   # posterior samples for evaluation
+--modelfolder <name>            # if set: skip train, load save/<name>/model.pth
+--white-noise                   # vanilla CSDI
+# plus noise-blend flags listed above
+```
+
+**Outputs:** under `./save/<save_prefix>_<run_id>/` with `config.json`, per missing-ratio folders, metrics (RMSE, MAE, CRPS, etc.).
+
+---
+
+## Pseudotime reordering (`reorder_rna.py`)
+
+Produces a **cells × (genes + `h`)** CSV with the **same** experimental labels `h` per cell, but **rows sorted by inferred pseudotime**. Training then uses `dataset_rna.parse_rna_data` as usual; only **within–timepoint row order** changes.
+
+### Command-line
 
 ```bash
-jupyter notebook visualize_examples.ipynb
+python reorder_rna.py --dataset rna --method dpt
+python reorder_rna.py --dataset mesc --method dpt --seed 42
+python reorder_rna.py --dataset auto --method phate
+python reorder_rna.py --input /path/to/custom.csv --output /path/to/out.csv --method slingshot
 ```
+
+| Argument | Role |
+|----------|------|
+| `--dataset` | `rna` (default), `mesc`, or `auto` (first preset input that exists) |
+| `--method` | `dpt` (default), `slingshot`, `phate` |
+| `--input` / `--output` | Override CSV paths (format auto-detected from header) |
+| `--seed` | RNG for DPT roots / PHATE (default 42) |
+
+**Preset outputs** (see `reorder_datasets.py`):
+
+- RNA: `data/rna/rna_reordered_{dpt,slingshot,phate}.csv`
+- mESC: `data/mESC/mesc_reordered_{dpt,slingshot,phate}.csv`
+
+### Choosing a method
+
+- **dpt** — Scanpy diffusion pseudotime, **multi-root consensus** from the earliest experimental time (Python only; default).
+- **slingshot** — R package **slingshot** on the **same PCA** as the neighbor graph; clusters = experimental time. Requires **rpy2** and R `slingshot`.
+- **phate** — 1D **PHATE** on the same PCA; orientation fixed by Spearman correlation with experimental time. Requires **phate**.
+
+All three share the same preprocessing: gene filtering, HVG (Seurat flavor), scaling, PCA, kNN (cosine), diffusion map for DPT.
+
+**mESC:** expression **0** is treated as missing in the reorder pipeline (zeros → NaN, then mean imputation after gene count filtering). Wide RNA uses NaNs as missing.
+
+### Training on reordered CSVs
+
+After generating the CSV:
+
+```bash
+python exe_rna_reorder.py --pseudotime-method dpt
+python exe_mesc_reorder.py --pseudotime-method phate
+```
+
+`--pseudotime-method` must match the CSV you created with `reorder_rna.py --method`.
+
+---
+
+## Important code locations
+
+| Piece | Location |
+|-------|----------|
+| Diffusion + blue/white noise + blend + rectified mapping | `main_model.py` (`CSDI_RNA`, `sample_diffusion_noise`, …) |
+| RNA wide CSV → tensors | `dataset_rna.py` |
+| mESC genes×samples → tensors | `dataset_mesc.py` |
+| Training loop, evaluation metrics | `utils.py` |
+| Sweep + CLI flags | `rna_experiment_sweep.py` |
+| YAML configs | `config/base.yaml`, `config/base_mesc.yaml` |
+| Blue-noise precompute | `gen_bn.py` |
+| Reorder pipeline | `reorder_rna.py`, `reorder_datasets.py` |
+
+**Diffusion schedule** (β schedule, `num_steps`, etc.) lives under `diffusion:` in the YAML files, separate from the **noise blend** schedule.

@@ -6,8 +6,49 @@ import math
 from scipy.optimize import linear_sum_assignment
 from diff_models import diff_CSDI
 
+
+def _compute_cumulative_instant_blue(num_steps, beta, gamma_start, gamma_end, gamma_tau):
+    """
+    Same *target shape* as the sigmoid schedule: S(i)=σ(γ_s+(γ_e-γ_s)(i/T)^τ) with i=0..T-1
+    (matches get_noise_blend_weight for schedule "sigmoid"). Interpret S as a cumulative
+    progression and set G*(i)=(S(i)-S(0))/(S(T-1)-S(0)) in [0,1].
+
+    Then N_0=0, N_{i+1}=(1-β_i)N_i+β_i and per-step linear blue fraction γ_i with the same
+    mixing as sigmoid/linear: ε = (1-γ_i) ε_white + γ_i ε_blue (Gaussian weight w = 1-γ_i).
+
+    Training and imputation both use the same precomputed γ_i at each timestep.
+    """
+    T = int(num_steps)
+    beta = np.asarray(beta, dtype=np.float64)
+    if beta.shape[0] != T:
+        raise ValueError(f"beta length {beta.shape[0]} != num_steps {T}")
+
+    ti = np.arange(T, dtype=np.float64) / float(max(T, 1))
+    x = float(gamma_start) + (float(gamma_end) - float(gamma_start)) * (ti ** float(gamma_tau))
+    s = 1.0 / (1.0 + np.exp(-np.clip(x, -60.0, 60.0)))
+    den = float(s[-1] - s[0])
+    if abs(den) < 1e-12:
+        g_star = np.linspace(0.0, 1.0, T, dtype=np.float64)
+    else:
+        g_star = (s - s[0]) / den
+    g_star = np.clip(g_star, 0.0, 1.0)
+
+    n_arr = np.zeros(T + 1, dtype=np.float64)
+    for i in range(T):
+        n_arr[i + 1] = (1.0 - beta[i]) * n_arr[i] + beta[i]
+
+    gamma = np.zeros(T, dtype=np.float64)
+    for i in range(T):
+        b = max(float(beta[i]), 1e-8)
+        g_curr = g_star[i]
+        g_prev = g_star[i - 1] if i > 0 else 0.0
+        numer = g_curr * n_arr[i + 1] - (1.0 - beta[i]) * g_prev * n_arr[i]
+        gamma[i] = numer / b
+    return np.clip(gamma, 0.0, 1.0)
+
+
 class CSDI_base(nn.Module):
-    def __init__(self, target_dim, config, device):
+    def __init__(self, target_dim, config, device, tile_k=None, tile_l=None):
         super().__init__()
         self.device = device
         self.target_dim = target_dim
@@ -52,21 +93,87 @@ class CSDI_base(nn.Module):
             .unsqueeze(1).unsqueeze(1)
         )
 
-        # 3) correlation => Blue Noise Cholesky factor
-        # Here we use the precomputed blue noise chol (instead of the param-based decay matrix)
-        self.tile_k = 100
-        self.tile_l = 5
-        self.cov_save_path = config["model"].get("cov_save_path", "blue_noise_chol_matrix_rnaB2.pt")
-        self.L_chol_small = self.create_covariance_matrix_2d(
-            K=self.tile_k,
-            L_max=self.tile_l,
-            save_path=self.cov_save_path
-        ).to(self.device)
+        # 3) Blue vs white noise: correlated (gen_bn Cholesky) vs i.i.d. Gaussian (vanilla CSDI)
+        self.use_blue_noise = config["model"].get("use_blue_noise", True)
+        # RNA passes tile_k/tile_l from the dataset; Physio/Forecasting omit them and use defaults here.
+        self.tile_k = tile_k if tile_k is not None else 100
+        self.tile_l = tile_l if tile_l is not None else 5
+        self.cov_save_path = config["model"].get(
+            "cov_save_path", "blue_noise/blue_noise_chol_matrix_rna.pt"
+        )
+        if self.use_blue_noise:
+            self.L_chol_small = self.create_covariance_matrix_2d(
+                K=self.tile_k,
+                L_max=self.tile_l,
+                save_path=self.cov_save_path
+            ).to(self.device)
+        else:
+            self.L_chol_small = None
+            print(
+                "[INFO] White noise mode (vanilla CSDI): use_blue_noise=false; "
+                "no blue-noise Cholesky loaded."
+            )
 
-        # 4) gamma(t)
+        # 4) noise blend (only used when use_blue_noise): w * gaussian + (1-w) * correlated blue noise
+        _nbs = config["model"].get("noise_blend_schedule", "sigmoid")
+        self.noise_blend_schedule = str(_nbs).lower().strip()
+        _allowed_sched = ("sigmoid", "linear", "cumulative", "step")
+        if self.noise_blend_schedule not in _allowed_sched:
+            raise ValueError(
+                f"model.noise_blend_schedule must be one of {_allowed_sched}, got {_nbs!r}"
+            )
         self.gamma_start = config["model"].get("gamma_start", 0.0)
         self.gamma_end   = config["model"].get("gamma_end",   3.0)
         self.gamma_tau   = config["model"].get("gamma_tau",   0.2)
+        _step_t = config["model"].get("noise_blend_step_t")
+        if _step_t is None:
+            _step_t = self.num_steps // 2
+        self.step_blue_steps = int(max(0, min(int(_step_t), self.num_steps)))
+        self.noise_blend_w_start = float(config["model"].get("noise_blend_w_start", 0.0))
+        self.noise_blend_w_start = max(0.0, min(1.0, self.noise_blend_w_start))
+        _per_rev = config["model"].get(f"noise_blend_reverse_{self.noise_blend_schedule}")
+        if _per_rev is not None:
+            self.noise_blend_reverse = bool(_per_rev)
+        else:
+            self.noise_blend_reverse = bool(config["model"].get("noise_blend_reverse", False))
+        if self.noise_blend_schedule == "cumulative":
+            cg = _compute_cumulative_instant_blue(
+                self.num_steps,
+                self.beta,
+                self.gamma_start,
+                self.gamma_end,
+                self.gamma_tau,
+            )
+            self.register_buffer(
+                "cumulative_instant_blue",
+                torch.tensor(cg, dtype=torch.float32),
+            )
+            print(
+                "[INFO] noise_blend_schedule=cumulative: G* = rescaled sigmoid curve; "
+                "linear mix like sigmoid schedule; per-step γ from N_t recurrence"
+            )
+        else:
+            self.register_buffer(
+                "cumulative_instant_blue",
+                torch.zeros(self.num_steps, dtype=torch.float32),
+            )
+
+        if self.noise_blend_schedule == "step":
+            tb, Tn = self.step_blue_steps, self.num_steps
+            w0 = self.noise_blend_w_start
+            print(
+                f"[INFO] noise_blend_schedule=step: w={w0} for i < {tb}, w=1 for i >= {tb}; num_steps={Tn}"
+            )
+        if self.noise_blend_schedule == "linear" and self.noise_blend_w_start != 0.0:
+            print(
+                f"[INFO] noise_blend_schedule=linear: w from {self.noise_blend_w_start} -> 1.0 over t "
+                f"(noise_blend_w_start)"
+            )
+        if self.noise_blend_reverse:
+            print(
+                "[INFO] noise_blend_reverse=true: effective blend time (T-1)-t "
+                f"(schedule={self.noise_blend_schedule})"
+            )
 
         # 5) Standard rectified mapping using Hungarian
         self.use_rectified_mapping = config["model"].get("use_rectified_mapping", True)
@@ -75,16 +182,22 @@ class CSDI_base(nn.Module):
     # ------------------------------------------------
     # Load blue noise Cholesky factor from file
     # ------------------------------------------------
-    def create_covariance_matrix_2d(self, K, L_max, save_path="blue_noise_chol_matrix_rnaB2.pt"):
-        if os.path.exists(save_path):
-            print(f"[INFO] Loading blue noise Cholesky factor from '{save_path}'")
-            L_chol = torch.load(save_path)
-            return L_chol
-        else:
-            raise FileNotFoundError(
-                f"Blue noise Cholesky matrix not found at '{save_path}'. "
-                "Please generate it first using your blue noise simulation."
-            )
+    def create_covariance_matrix_2d(
+        self, K, L_max, save_path="blue_noise/blue_noise_chol_matrix_rna.pt"
+    ):
+        path = save_path
+        if not os.path.isabs(path) and not os.path.exists(path):
+            _repo = os.path.dirname(os.path.abspath(__file__))
+            alt = os.path.join(_repo, path)
+            if os.path.exists(alt):
+                path = alt
+        if os.path.exists(path):
+            print(f"[INFO] Loading blue noise Cholesky factor from '{path}'")
+            return torch.load(path)
+        raise FileNotFoundError(
+            f"Blue noise Cholesky matrix not found at '{save_path}' (cwd={os.getcwd()}). "
+            "Generate it with: python gen_bn.py --dataset rna   or   --dataset mesc"
+        )
 
     # ------------------------------------------------
     # Generate a single tile
@@ -124,11 +237,65 @@ class CSDI_base(nn.Module):
         else:
             return self.generate_correlated_noise_2d_tiled(B, K, L)
 
-    # gamma(t)
+    def sample_diffusion_noise(self, B, K, L, t):
+        """
+        Noise ε for the forward noising step.
+        White: i.i.d. Gaussian. Blue: blend of Gaussian and Cholesky-correlated noise (schedule in get_noise_blend_weight).
+        """
+        noise_gauss = torch.randn(B, K, L, device=self.device)
+        if not self.use_blue_noise:
+            return noise_gauss
+        noise_corr = self.generate_correlated_noise_2d(B, K, L)
+        blend_w = self.get_noise_blend_weight(t).view(B, 1, 1)
+        return blend_w * noise_gauss + (1.0 - blend_w) * noise_corr
+
+    def _map_blend_time(self, t_tensor):
+        """Forward: use t. Reverse: (T-1)-t so w(t)=w_fwd(T-1-t) on indices 0..T-1."""
+        t = t_tensor.float()
+        if not self.noise_blend_reverse:
+            return t
+        return (self.num_steps - 1) - t
+
     def get_gamma(self, t_tensor):
-        x = self.gamma_start + (self.gamma_end - self.gamma_start) * ((t_tensor / self.num_steps) ** self.gamma_tau)
-        gamma = torch.sigmoid(x)
-        return gamma
+        """
+        Power-warped sigmoid schedule (noise_blend_schedule: sigmoid).
+        Gaussian weight w = σ(γ_s + (γ_e-γ_s)(t/T)^τ). Other schedules do not use this.
+        """
+        t = self._map_blend_time(t_tensor)
+        x = self.gamma_start + (self.gamma_end - self.gamma_start) * (
+            (t / self.num_steps) ** self.gamma_tau
+        )
+        return torch.sigmoid(x)
+
+    def get_noise_blend_weight(self, t_tensor):
+        """
+        Weight w in [0, 1] on Gaussian noise vs correlated noise:
+        ε = w ε_white + (1-w) ε_blue. Sigmoid uses get_gamma(); cumulative uses precomputed 1-γ_t;
+        linear/step use noise_blend_w_start where applicable.
+        """
+        if self.noise_blend_schedule == "cumulative":
+            idx = t_tensor.long().clamp(0, self.num_steps - 1)
+            if self.noise_blend_reverse:
+                idx = (self.num_steps - 1) - idx
+            return 1.0 - self.cumulative_instant_blue[idx].float()
+        if self.noise_blend_schedule == "linear":
+            t = self._map_blend_time(t_tensor)
+            denom = max(self.num_steps - 1, 1)
+            u = (t / denom).clamp(0.0, 1.0)
+            w0 = self.noise_blend_w_start
+            return w0 + (1.0 - w0) * u
+        if self.noise_blend_schedule == "step":
+            idx = t_tensor.long().clamp(0, self.num_steps - 1)
+            if self.noise_blend_reverse:
+                idx = (self.num_steps - 1) - idx
+            base = t_tensor.float()
+            w0 = float(self.noise_blend_w_start)
+            return torch.where(
+                idx < self.step_blue_steps,
+                torch.full_like(base, w0),
+                torch.ones_like(base),
+            )
+        return self.get_gamma(t_tensor)
 
     # ------------------------------------------------
     # Standard rectification: Hungarian assignment
@@ -222,26 +389,21 @@ class CSDI_base(nn.Module):
 
         current_alpha = self.alpha_torch[t.long()]
 
-        # 1) standard Gauss vs correlated
-        noise_gauss = torch.randn(B, K, L, device=self.device)
-        noise_corr = self.generate_correlated_noise_2d(B, K, L)
+        # 1) white (Gaussian) or blue (correlated + blend schedule)
+        noise = self.sample_diffusion_noise(B, K, L, t)
 
-        # 2) gamma(t)
-        gamma_vals = self.get_gamma(t).view(B, 1, 1)
-        noise = gamma_vals * noise_gauss + (1.0 - gamma_vals) * noise_corr
-
-        # 3) standard rectification
+        # 2) standard rectification
         if self.use_rectified_mapping and is_train == 1:
             noise = self.rectify_mapping(observed_data, noise)
 
-        # 4) forward noising
+        # 3) forward noising
         noisy_data = (current_alpha**0.5) * observed_data + (1.0 - current_alpha)**0.5 * noise
 
         t_int = t.long()
         total_input = self.set_input_to_diffmodel(noisy_data, observed_data, cond_mask)
         predicted = self.diffmodel(total_input, side_info, t_int)
 
-        # 5) loss
+        # 4) loss
         target_mask = observed_mask - cond_mask
         residual = (noise - predicted) * target_mask
         num_eval = target_mask.sum()
@@ -274,13 +436,9 @@ class CSDI_base(nn.Module):
             current_sample = torch.randn_like(observed_data)
 
             for t in range(self.num_steps - 1, -1, -1):
-                t_val = torch.tensor([float(t)], device=self.device)
-                gamma_val = self.get_gamma(t_val)
-                gamma_t = gamma_val.view(1, 1, 1)
-
-                noise_gauss = torch.randn(B, K, L, device=self.device)
-                noise_corr = self.generate_correlated_noise_2d(B, K, L)
-                noise_blend = gamma_t * noise_gauss + (1.0 - gamma_t) * noise_corr
+                # Match training: same white vs blue rule
+                t_batch = torch.full((B,), float(t), device=self.device, dtype=torch.float32)
+                noise_blend = self.sample_diffusion_noise(B, K, L, t_batch)
 
                 if self.use_rectified_mapping:
                     noise_blend = self.rectify_mapping(observed_data, noise_blend)
@@ -375,36 +533,13 @@ class CSDI_Physio(CSDI_base):
             cut_length,
         )
     
-class CSDI_RNAS(CSDI_base):
-    def __init__(self, config, device, target_dim=45):
-        super(CSDI_RNAS, self).__init__(target_dim, config, device)
-
-    def process_data(self, batch):
-        observed_data = batch["observed_data"].to(self.device).float()
-        observed_mask = batch["observed_mask"].to(self.device).float()
-        observed_tp = batch["timepoints"].to(self.device).float()
-        gt_mask = batch["gt_mask"].to(self.device).float()
-
-        # Permute for (Batch, Genes, Time) format
-        observed_data = observed_data.permute(0, 2, 1)
-        observed_mask = observed_mask.permute(0, 2, 1)
-        gt_mask = gt_mask.permute(0, 2, 1)
-        cut_length = torch.zeros(len(observed_data)).long().to(self.device)
-
-        for_pattern_mask = observed_mask
-
-        return (
-            observed_data,
-            observed_mask,
-            observed_tp,
-            gt_mask,
-            for_pattern_mask,
-            cut_length,
-        )
-
 class CSDI_RNA(CSDI_base):
-    def __init__(self, config, device, target_dim=100):
-        super(CSDI_RNA, self).__init__(target_dim, config, device)
+    """CSDI for RNA-style batches: (cells, timepoints, genes); blue-noise tile K×L from dataset."""
+
+    def __init__(self, config, device, target_dim, num_timepoints=None):
+        tile_k = target_dim
+        tile_l = num_timepoints if num_timepoints is not None else 5
+        super().__init__(target_dim, config, device, tile_k=tile_k, tile_l=tile_l)
 
     def process_data(self, batch):
         observed_data = batch["observed_data"].to(self.device).float()
@@ -412,7 +547,6 @@ class CSDI_RNA(CSDI_base):
         observed_tp = batch["timepoints"].to(self.device).float()
         gt_mask = batch["gt_mask"].to(self.device).float()
 
-        # Permute for (Batch, Genes, Time) format
         observed_data = observed_data.permute(0, 2, 1)
         observed_mask = observed_mask.permute(0, 2, 1)
         gt_mask = gt_mask.permute(0, 2, 1)

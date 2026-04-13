@@ -167,6 +167,12 @@ def evaluate(model, test_loader, nsample=100, scaler=1, mean_scaler=0, foldernam
                     refresh=True,
                 )
 
+            if len(all_target) == 0:
+                raise ValueError(
+                    "evaluate: test_loader produced no batches (empty test split?). "
+                    "Need at least one batch to compute metrics."
+                )
+
             with open(
                 foldername + "/generated_outputs_nsample" + str(nsample) + ".pk", "wb"
             ) as f:
@@ -207,7 +213,17 @@ def evaluate(model, test_loader, nsample=100, scaler=1, mean_scaler=0, foldernam
                     ],
                     f,
                 )
-                print("RMSE:", np.sqrt(mse_total / evalpoints_total))
-                print("MAE:", mae_total / evalpoints_total)
+                rmse = np.sqrt(mse_total / evalpoints_total)
+                mae = mae_total / evalpoints_total
+                mse = mse_total / evalpoints_total
+                print("RMSE:", rmse)
+                print("MAE:", mae)
                 print("CRPS:", CRPS)
                 print("CRPS_sum:", CRPS_sum)
+                return {
+                    "mse": float(mse),
+                    "rmse": float(rmse),
+                    "mae": float(mae),
+                    "crps": float(CRPS),
+                    "crps_sum": float(CRPS_sum),
+                }

@@ -1,8 +1,26 @@
+# Single environment for training (exe_*.py), blue-noise precompute (gen_bn.py), and reorder (reorder_rna.py).
+# NumPy 2.x is incompatible with many PyTorch builds and gen_bn; keep <2.
+numpy<2
+
 torch
 pandas
-numpy
-tqdm
+scipy
 pyyaml
 matplotlib
+seaborn
+tqdm
 wget
 linear_attention_transformer
+
+# Pseudotime reordering (reorder_rna.py --method phate)
+phate
+
+# Pseudotime reordering (reorder_rna.py): HVG / PCA / neighbors / DPT
+scanpy
+
+# Optional: reorder_rna.py --method slingshot
+#   pip install rpy2
+#   In R: install.packages("BiocManager"); BiocManager::install("slingshot")
+#
+# Optional: Jupyter for .ipynb notebooks (pseudotime_comparison, etc.)
+#   pip install jupyter ipykernel

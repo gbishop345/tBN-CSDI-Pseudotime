@@ -24,3 +24,27 @@ model:
   timeemb: 128
   featureemb: 16
   target_strategy: "random"
+  # true = blue/correlated noise (gen_bn Cholesky + blend below); false = white i.i.d. Gaussian (vanilla CSDI)
+  use_blue_noise: true
+  # From repo root: run ``python gen_bn.py --dataset rna`` (or mESC + base_mesc.yaml)
+  cov_save_path: blue_noise/blue_noise_chol_matrix_rna.pt
+  # Gaussian vs blue-noise blend: noise = w*gauss + (1-w)*corr
+  # "sigmoid" = w(t)=σ(γ_s + (γ_e-γ_s)(t/T)^τ) — keys gamma_start/end/tau
+  # "linear" = w = w0 + (1-w0)*t/(num_steps-1)
+  # "cumulative" = same G* shape as sigmoid (rescaled 0→1), then per-step γ from N_t
+  # "step" = w=w0 for i < noise_blend_step_t, else w=1. null => num_steps//2
+  noise_blend_schedule: "sigmoid"
+  # If true: blend uses effective time (T-1)-t so w(t) equals forward schedule at end of grid (e.g. high→low white).
+  noise_blend_reverse: false
+  # Optional per-schedule override when that schedule is active (true/false); omit to use noise_blend_reverse only.
+  # noise_blend_reverse_sigmoid: false
+  # noise_blend_reverse_linear: false
+  # noise_blend_reverse_step: false
+  # noise_blend_reverse_cumulative: false
+  noise_blend_step_t: null
+  # For linear/step only; CLI: --blend-start W in [0,1]. Gaussian weight at t=0 (linear) or i < step_t (step).
+  noise_blend_w_start: 0.0
+  # sigmoid schedule: w(t)=σ(γ_s + (γ_e-γ_s)(t/T)^τ). More negative γ_s => more blue at t=0.
+  gamma_start: 0.0
+  gamma_end: 3.0
+  gamma_tau: 0.2

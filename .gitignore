@@ -1,0 +1,50 @@
+# Virtual env (large – PyTorch etc.)
+.venv/
+venv/
+env/
+
+# Shell scripts (not tracked)
+*.sh
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+*.egg
+.Python
+build/
+dist/
+pip-wheel-metadata/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Editors / IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project outputs (optional – uncomment if you don’t want to track)
+# save/
+# Large reference masks from gen_bn.py
+blue_noise/*.npz
+# blue_noise/*.pt
+
+# mESC dataset caches (next to ExpressionData.csv)
+data/mESC/*.pk
+data/mESC/ExpressionData.csv
